@@ -240,11 +240,107 @@ PY
     fi
 }
 
+get_share_internet_mode() {
+    # Returns "auto" (default), "always" or "never".
+    # Controls whether the hotspot advertises itself as default gateway/DNS.
+    if [ -f "$HOTSPOT_CONFIG_FILE" ] && command -v python3 >/dev/null 2>&1; then
+        local configured_mode
+        configured_mode=$(python3 - "$HOTSPOT_CONFIG_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    raise SystemExit(0)
+
+mode = data.get("share_internet")
+if not isinstance(mode, str):
+    raise SystemExit(0)
+
+candidate = mode.strip().lower()
+if candidate in {"auto", "always", "never"}:
+    print(candidate)
+PY
+)
+        if [ -n "$configured_mode" ]; then
+            printf "%s" "$configured_mode"
+            return
+        fi
+    fi
+
+    printf "auto"
+}
+
+has_upstream_connectivity() {
+    # True if the Pi has an IPv4 default route via any interface other
+    # than the hotspot interface (ethernet or wifi client uplink).
+    ip -4 route show default 2>/dev/null | grep -v "dev $HOTSPOT_IFACE" | grep -q "^default"
+}
+
+configure_gateway_advertisement() {
+    local dnsmasq_shared_dir="/etc/NetworkManager/dnsmasq-shared.d"
+    local no_gateway_conf="$dnsmasq_shared_dir/pins-no-gateway.conf"
+    local mode advertise_gateway
+
+    mode="$(get_share_internet_mode)"
+
+    case "$mode" in
+        always)
+            advertise_gateway=1
+            ;;
+        never)
+            advertise_gateway=0
+            ;;
+        *)
+            if has_upstream_connectivity; then
+                advertise_gateway=1
+            else
+                advertise_gateway=0
+            fi
+            ;;
+    esac
+
+    mkdir -p "$dnsmasq_shared_dir" 2>/dev/null || true
+
+    if [ "$advertise_gateway" -eq 1 ]; then
+        # Default NetworkManager shared-mode behavior: advertise the Pi as
+        # gateway/DNS so clients can use the Pi's upstream connectivity.
+        rm -f "$no_gateway_conf" 2>/dev/null || true
+        echo "Hotspot gateway mode: sharing internet (mode=$mode)."
+    else
+        # Local-only mode: suppress default gateway (DHCP option 3) and DNS
+        # (option 6) so client devices treat the hotspot as a local network
+        # and keep using mobile data for internet access. PINS stays
+        # reachable via the hotspot IP (default 10.42.0.1).
+        if cat > "$no_gateway_conf" <<'EOF'
+# Managed by PINS (wifi-connect.sh). Do not edit manually.
+# Suppress default gateway (option 3) and DNS server (option 6) in DHCP
+# offers. Client devices treat this hotspot as a local-only network and
+# keep using mobile data for internet access.
+dhcp-option=3
+dhcp-option=6
+EOF
+        then
+            echo "Hotspot gateway mode: local-only, clients keep mobile data (mode=$mode)."
+        else
+            echo "Warning: failed to write $no_gateway_conf. Hotspot will advertise gateway."
+        fi
+    fi
+}
+
 enable_hotspot() {
     echo "Connection failed (or forcing hotspot). Re-enabling hotspot..."
 
     # Ensure client mode is dropped before creating AP mode.
     nmcli device disconnect "$HOTSPOT_IFACE" >/dev/null 2>&1 || true
+
+    # Decide whether the hotspot should advertise itself as default
+    # gateway/DNS. Must happen before NetworkManager spawns dnsmasq for
+    # the shared connection so the drop-in applies from the first lease.
+    configure_gateway_advertisement
 
     # Remove legacy hotspot profiles so nmcli creates a fresh AP with current password.
     existing_hotspots=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep -E "^(Hotspot|hotspot-ap):802-11-wireless" | cut -d: -f1)
@@ -506,4 +602,3 @@ if [ -n "$CURRENT_CONN" ]; then
     nmcli connection modify "$CURRENT_CONN" 802-11-wireless.powersave 2 || true
 fi
 exit 0
-
